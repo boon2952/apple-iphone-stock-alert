@@ -1,0 +1,76 @@
+name: iPhone stock monitor
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'dry-run=確認のみ / monitor=状態保存と通知（LINE未設定でも可）'
+        type: choice
+        options: [dry-run, monitor]
+        default: dry-run
+permissions:
+  contents: write
+concurrency:
+  group: iphone-stock-monitor
+  cancel-in-progress: false
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: Restore durable state (errors must not reset baseline)
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_ref=$(git ls-remote --heads origin refs/heads/monitor-state)
+          if [ -n "$remote_ref" ]; then
+            git fetch origin monitor-state
+            git show FETCH_HEAD:state.json > state.json
+            echo "STATE_PARENT=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_ENV"
+          fi
+      - name: Check Apple and notify
+        id: check
+        env:
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          LINE_TO: ${{ secrets.LINE_TO }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$MODE" = 'dry-run' ]; then
+            python monitor.py --dry-run
+          else
+            python monitor.py
+          fi
+      - name: Save state even if LINE fails
+        if: ${{ always() && steps.check.outcome != 'skipped' && inputs.mode != 'dry-run' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f state.json || exit 0
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          export GIT_INDEX_FILE="$RUNNER_TEMP/state-index"
+          rm -f "$GIT_INDEX_FILE"
+          git read-tree --empty
+          git add -f state.json
+          tree=$(git write-tree)
+          if [ -n "${STATE_PARENT:-}" ]; then
+            if [ "$tree" = "$(git rev-parse "$STATE_PARENT^{tree}")" ]; then exit 0; fi
+            commit=$(git commit-tree "$tree" -p "$STATE_PARENT" -m 'Save monitor state')
+          else
+            commit=$(git commit-tree "$tree" -m 'Initialize monitor state')
+          fi
+          git push origin "$commit:refs/heads/monitor-state"
+      - name: Save diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-report-${{ github.run_id }}
+          path: report.json
+          retention-days: 7
+          if-no-files-found: ignore

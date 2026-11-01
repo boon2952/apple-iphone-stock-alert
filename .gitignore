@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+work/
+state.json
+report.json
+.env
